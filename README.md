@@ -9,15 +9,17 @@ A Python desktop application (Tkinter GUI) that downloads videos from any Vimeo 
 - **Credentials loaded from a JSON file** — browse for a file containing `access_token`, `client_id`, and `client_secret`; all three fields are displayed as masked entries with individual Show/Hide toggles
 - **Client-credentials OAuth flow** — if no `access_token` is provided, the app automatically exchanges `client_id` + `client_secret` for a token via Vimeo's OAuth endpoint
 - **Configurable profile URL** — download from any public Vimeo profile (`https://vimeo.com/username`), channel (`https://vimeo.com/channels/name`), or leave blank to use the authenticated account (`/me/videos`)
+- **Fetch limit** — optionally cap how many videos are fetched (useful for quick testing); leave empty to fetch all
 - Fetches the **complete video library** with automatic pagination
 - Displays videos in a scrollable, interactive checklist with:
-  - Video name
-  - Created date/time (converted to local timezone)
-  - Duration
-  - Best available quality
-  - File size
-  - Download status
-- **Filter toggle** — hide videos that have no duration, quality or size information
+  - **Video Title** — original title from Vimeo
+  - **Video File Name** — auto-generated sanitized filename (see [File Naming](#file-naming) below)
+  - **Created** — upload date/time converted to local timezone
+  - **Duration**
+  - **Best available quality**
+  - **File size**
+  - **Download status**
+- **Filter toggle** — hide videos that have no duration, quality, or size information
 - **Two-stage download strategy**
   1. Direct signed URL from the Vimeo API (fastest, no extra tool required)
   2. Falls back to **yt-dlp** for videos without an API download link
@@ -25,7 +27,7 @@ A Python desktop application (Tkinter GUI) that downloads videos from any Vimeo 
 - Per-video **progress bar** with bytes downloaded and percentage
 - Overall progress bar across all selected videos
 - **Skip already-downloaded** files automatically (checks file size)
-- Optional **number-prefix filenames** (e.g. `001_MyVideo.mp4`)
+- Optional **number-prefix filenames** (e.g. `001_20240315_143022_Sunday_Service.mp4`)
 - Scrollable main window — all controls remain accessible at any window size
 - Cancel in-progress downloads cleanly
 - Timestamped log panel
@@ -35,7 +37,8 @@ A Python desktop application (Tkinter GUI) that downloads videos from any Vimeo 
 ## Requirements
 
 - Python 3.10 or later
-- `requests` — HTTP client for Vimeo API calls
+- `PyVimeo` — official Vimeo Python SDK for all API calls
+- `requests` — HTTP client (used internally by PyVimeo and for streaming downloads)
 - `yt-dlp` — fallback downloader for videos without a direct API link
 
 Install all dependencies:
@@ -72,6 +75,35 @@ All three keys are required. You can omit the token value (leave it as an empty 
 
 ---
 
+## File Naming
+
+Downloaded files are named automatically using the following format:
+
+```
+YYYYMMDD_HHMMSS_<sanitized_title>.mp4
+```
+
+- **`YYYYMMDD_HHMMSS`** — the video's creation timestamp in your local timezone
+- The title is sanitized by replacing spaces, periods, and any Windows-invalid characters (`\ / : * ? " < > |`) with `_`
+- The first letter after each `_` separator is capitalised
+
+**Examples:**
+
+| Vimeo Title | Generated filename |
+|---|---|
+| `Sunday Service 03.09.25` | `20250309_103000_Sunday_Service_03_09_25.mp4` |
+| `Weekly Update: Team/Dev` | `20260114_090000_Weekly_Update__Team_Dev.mp4` |
+
+The **Video File Name** column in the video list shows the exact filename that will be used before you start a download.
+
+If the **Number-prefix filenames** option is enabled, a zero-padded index is prepended:
+
+```
+001_20240315_143022_Sunday_Service.mp4
+```
+
+---
+
 ## Usage
 
 ```bash
@@ -82,11 +114,12 @@ python app.py
 2. The Access Token, Client ID, and Client Secret fields will populate automatically (masked by default — click **Show** to reveal any field).
 3. Optionally edit the **Profile URL** to target a specific Vimeo profile or channel (defaults to `https://vimeo.com/cbcmrcf`).
 4. Choose an **Output Folder** (defaults to `~/Downloads/Vimeo`).
-5. Select a **Quality** preference and click **🔍 Fetch Videos**.
-6. Once the list loads, use **Select All / Deselect All** or click individual checkboxes to choose which videos to download.
-7. Optionally enable **Hide videos without duration / quality / size** to filter out unavailable videos.
-8. Click **⬇ Download Selected** and monitor progress in real time.
-9. Click **Open Folder** to open the output directory when done.
+5. Optionally enter a **Limit** to fetch only the first N videos (leave empty to fetch all).
+6. Select a **Quality** preference and click **🔍 Fetch Videos**.
+7. Once the list loads, use **Select All / Deselect All** or click individual checkboxes to choose which videos to download. Review the **Video File Name** column to confirm the generated filenames.
+8. Optionally enable **Hide videos without duration / quality / size** to filter out unavailable videos.
+9. Click **⬇ Download Selected** and monitor progress in real time.
+10. Click **Open Folder** to open the output directory when done.
 
 ---
 

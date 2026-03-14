@@ -22,6 +22,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import requests
+import vimeo
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -71,41 +72,35 @@ class VimeoAPI:
         self.token = token
         self.client_id = client_id
         self.client_secret = client_secret
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"bearer {token}",
-                "Accept": "application/vnd.vimeo.*+json;version=3.4",
-            }
+        self.client = vimeo.VimeoClient(
+            token=token or None,
+            key=client_id or None,
+            secret=client_secret or None,
         )
+        # Separate session used only for streaming file downloads
+        self.session = requests.Session()
+        self.session.headers["Authorization"] = f"bearer {token}"
 
     @classmethod
     def from_client_credentials(cls, client_id: str, client_secret: str) -> "VimeoAPI":
-        """Exchange client credentials for an app-level access token."""
-        resp = requests.post(
-            f"{VIMEO_API_BASE}/oauth/authorize/client",
-            auth=(client_id, client_secret),
-            json={"grant_type": "client_credentials", "scope": "public private video_files"},
-            headers={"Accept": "application/vnd.vimeo.*+json;version=3.4"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        token = resp.json().get("access_token", "")
+        """Exchange client credentials for an access token via PyVimeo."""
+        temp = vimeo.VimeoClient(key=client_id, secret=client_secret)
+        token = temp.load_client_credentials(["public", "private", "video_files"])
         if not token:
             raise ValueError("No access_token returned by Vimeo OAuth endpoint.")
         return cls(token, client_id=client_id, client_secret=client_secret)
 
     # ------------------------------------------------------------------
     def get_me(self) -> dict:
-        r = self.session.get(f"{VIMEO_API_BASE}/me", timeout=15)
+        r = self.client.get("/me", timeout=15)
         r.raise_for_status()
         return r.json()
 
     # ------------------------------------------------------------------
-    def get_all_videos(self, progress_cb=None, base_path="/me/videos") -> list:
-        """Return every video in the authenticated user's library."""
+    def get_all_videos(self, progress_cb=None, base_path="/me/videos", limit=None) -> list:
+        """Return videos from the library. Pass limit=N to cap the number fetched."""
         videos: list = []
-        url = f"{VIMEO_API_BASE}{base_path}"
+        path = base_path
         params = {
             "fields": (
                 "uri,name,duration,link,download,pictures,status,privacy,created_time"
@@ -114,26 +109,31 @@ class VimeoAPI:
             "page": 1,
         }
 
-        while url:
-            r = self.session.get(url, params=params, timeout=30)
+        while path:
+            page_size = 100 if limit is None else min(100, limit - len(videos))
+            if page_size <= 0:
+                break
+            if params is not None:
+                params["per_page"] = page_size
+            r = self.client.get(path, params=params, timeout=30)
             r.raise_for_status()
             data = r.json()
 
             videos.extend(data.get("data", []))
+            if limit is not None and len(videos) >= limit:
+                videos = videos[:limit]
+                break
             if progress_cb:
                 progress_cb(len(videos), data.get("total", 0))
 
             next_path = data.get("paging", {}).get("next")
             if next_path:
-                # next_path is a relative path like /me/videos?page=2&…
-                url = (
-                    next_path
-                    if next_path.startswith("http")
-                    else f"{VIMEO_API_BASE}{next_path}"
-                )
-                params = None  # params are already embedded in the URL
+                # PyVimeo prepends API_ROOT when the URL doesn't start with "http",
+                # so both relative paths and full URLs are handled correctly.
+                path = next_path
+                params = None  # params are already embedded in the next URL
             else:
-                url = None
+                path = None
 
         return videos
 
@@ -177,6 +177,7 @@ class DownloadWorker(threading.Thread):
         self,
         api: VimeoAPI,
         videos: list,
+        filenames: list,
         output_dir: str,
         quality: str,
         add_number_prefix: bool,
@@ -188,6 +189,7 @@ class DownloadWorker(threading.Thread):
         super().__init__(daemon=True)
         self.api = api
         self.videos = videos
+        self.filenames = filenames
         self.output_dir = output_dir
         self.quality = quality
         self.add_number_prefix = add_number_prefix
@@ -209,13 +211,13 @@ class DownloadWorker(threading.Thread):
             if self._stop.is_set():
                 self.log_cb("Download cancelled by user.")
                 break
-            if not self._process_video(idx, total, pad, video):
+            if not self._process_video(idx, total, pad, video, self.filenames[idx]):
                 break
 
         if not self._stop.is_set():
             self.all_done_cb()
 
-    def _process_video(self, idx: int, total: int, pad: int, video: dict) -> bool:
+    def _process_video(self, idx: int, total: int, pad: int, video: dict, filename: str) -> bool:
         """Handle a single video download. Returns False if the loop should stop."""
         name = video.get("name") or f"video_{idx + 1}"
         uri = video.get("uri", "")
@@ -224,7 +226,7 @@ class DownloadWorker(threading.Thread):
         self.log_cb(f"\n[{idx + 1}/{total}] {name}")
         self.progress_cb(idx, total, 0, 0, name)
 
-        filepath = self._resolve_filepath(idx, pad, name, video, video_id)
+        filepath = self._resolve_filepath(idx, pad, filename, video, video_id)
         if filepath is None:
             # Already downloaded and skipped
             self.video_done_cb(idx, "skipped")
@@ -243,12 +245,13 @@ class DownloadWorker(threading.Thread):
             self.video_done_cb(idx, "failed")
         return True
 
-    def _resolve_filepath(self, idx: int, pad: int, name: str, video: dict, video_id: str):
+    def _resolve_filepath(self, idx: int, pad: int, filename: str, video: dict, video_id: str):
         """Return the destination filepath, or None if the video should be skipped."""
-        safe_name = sanitize_filename(name)
+        # filename already includes the .mp4 extension from _build_filename
+        base_name, ext = os.path.splitext(filename)
         if self.add_number_prefix:
-            safe_name = f"{str(idx + 1).zfill(pad)}_{safe_name}"
-        filepath = os.path.join(self.output_dir, f"{safe_name}.mp4")
+            base_name = f"{str(idx + 1).zfill(pad)}_{base_name}"
+        filepath = os.path.join(self.output_dir, f"{base_name}{ext}")
 
         if os.path.exists(filepath):
             dl_url, _q, size = self.api.best_download(video, self.quality)
@@ -513,9 +516,14 @@ class VimeoDownloaderApp:
         )
 
     def _build_fetch_row(self, cfg: ttk.Frame):
-        """Row 7: Fetch Videos button and logged-in user label."""
+        """Row 7: Fetch limit input, Fetch Videos button, and logged-in user label."""
         frame = ttk.Frame(cfg)
         frame.grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(10, 2))
+
+        ttk.Label(frame, text="Limit:").pack(side=tk.LEFT)
+        self.fetch_limit_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.fetch_limit_var, width=6).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(frame, text="(empty = fetch all)", foreground="grey").pack(side=tk.LEFT, padx=(0, 12))
 
         self.fetch_btn = ttk.Button(frame, text="🔍  Fetch Videos", command=self._fetch_videos)
         self.fetch_btn.pack(side=tk.LEFT)
@@ -551,19 +559,26 @@ class VimeoDownloaderApp:
         tree_frame = ttk.Frame(list_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        cols = ("check", "name", "created", "duration", "quality", "size", "status")
+        cols = ("check", "title", "filename", "created", "duration", "quality", "size", "status")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
 
         headings = {
-            "check": "✓", "name": "Video Name", "created": "Created",
-            "duration": "Duration", "quality": "Quality", "size": "Size", "status": "Status",
+            "check":    "✓",
+            "title":    "Video Title",
+            "filename": "Video File Name",
+            "created":  "Created",
+            "duration": "Duration",
+            "quality":  "Quality",
+            "size":     "Size",
+            "status":   "Status",
         }
         for col, text in headings.items():
             self.tree.heading(col, text=text)
 
         col_cfg = {
             "check":    dict(width=32,  minwidth=32,  stretch=False, anchor=tk.CENTER),
-            "name":     dict(width=280, minwidth=160),
+            "title":    dict(width=220, minwidth=140),
+            "filename": dict(width=220, minwidth=140),
             "created":  dict(width=130, minwidth=110, anchor=tk.CENTER),
             "duration": dict(width=80,  minwidth=60,  anchor=tk.CENTER),
             "quality":  dict(width=80,  minwidth=60,  anchor=tk.CENTER),
@@ -644,22 +659,30 @@ class VimeoDownloaderApp:
         )
         if not path:
             return
+        data = self._read_credentials_json(path)
+        if data is not None:
+            self._populate_credential_fields(data, path)
+
+    @staticmethod
+    def _read_credentials_json(path: str) -> "dict | None":
+        """Read and validate a credentials JSON file. Returns the dict or None on error."""
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except Exception as exc:
             messagebox.showerror("Load Error", f"Could not read credentials file:\n{exc}")
-            return
-
+            return None
         missing = [k for k in ("access_token", "client_id", "client_secret") if k not in data]
         if missing:
             messagebox.showerror(
                 "Invalid File",
                 f"The JSON file is missing required key(s): {', '.join(missing)}",
             )
-            return
+            return None
+        return data
 
-        # Populate the read-only entries
+    def _populate_credential_fields(self, data: dict, path: str):
+        """Write loaded credential values into the masked read-only entry fields."""
         for entry, var, key in (
             (self.token_entry,         self.token_var,         "access_token"),
             (self.client_id_entry,     self.client_id_var,     "client_id"),
@@ -668,9 +691,7 @@ class VimeoDownloaderApp:
             entry.config(state="normal")
             var.set(data[key])
             entry.config(state="readonly")
-
-        import os as _os
-        self.cred_file_var.set(_os.path.basename(path))
+        self.cred_file_var.set(os.path.basename(path))
 
     # ------------------------------------------------------------------
     # Parse Vimeo profile URL → API path
@@ -750,11 +771,26 @@ class VimeoDownloaderApp:
         self._log("Connecting to Vimeo API…")
 
         base_path = self._parse_profile_url(self.profile_url_var.get().strip())
+        limit, ok = self._parse_fetch_limit()
+        if not ok:
+            self.fetch_btn.config(state=tk.NORMAL, text="🔍  Fetch Videos")
+            return
         threading.Thread(
             target=self._run_fetch_worker,
-            args=(token, client_id, client_secret, base_path),
+            args=(token, client_id, client_secret, base_path, limit),
             daemon=True,
         ).start()
+
+    def _parse_fetch_limit(self) -> "tuple[int | None, bool]":
+        """Parse the Limit field. Returns (limit, True) on success or (None, False) on bad input."""
+        limit_str = self.fetch_limit_var.get().strip()
+        if not limit_str:
+            return None, True
+        try:
+            return max(1, int(limit_str)), True
+        except ValueError:
+            messagebox.showerror("Invalid Limit", "Limit must be a whole number.")
+            return None, False
 
     def _build_api(self, token: str, client_id: str, client_secret: str) -> "VimeoAPI":
         """Return an authenticated VimeoAPI, obtaining a token via client credentials if needed."""
@@ -763,7 +799,7 @@ class VimeoDownloaderApp:
         self._log("No access token – using client credentials to obtain a token…")
         return VimeoAPI.from_client_credentials(client_id, client_secret)
 
-    def _run_fetch_worker(self, token: str, client_id: str, client_secret: str, base_path: str):
+    def _run_fetch_worker(self, token: str, client_id: str, client_secret: str, base_path: str, limit=None):
         """Background thread: authenticate, fetch video list, and update the UI."""
         try:
             api = self._build_api(token, client_id, client_secret)
@@ -781,11 +817,19 @@ class VimeoDownloaderApp:
             videos = api.get_all_videos(
                 lambda fetched, total: self._log(f"  … {fetched} / {total} videos fetched"),
                 base_path=base_path,
+                limit=limit,
             )
             self.videos = videos
             self.root.after(0, lambda: self._populate_list(videos))
             self._log(f"Found {len(videos)} video(s).")
-        except requests.HTTPError as exc:
+        except Exception as exc:
+            self._handle_fetch_exception(exc)
+        finally:
+            self.root.after(0, lambda: self.fetch_btn.config(state=tk.NORMAL, text="🔍  Fetch Videos"))
+
+    def _handle_fetch_exception(self, exc: Exception):
+        """Log and show an appropriate error dialog for a fetch failure."""
+        if isinstance(exc, requests.HTTPError):
             code = exc.response.status_code if exc.response is not None else "?"
             if code == 401:
                 self._log("ERROR 401 – Authentication failed.")
@@ -798,11 +842,9 @@ class VimeoDownloaderApp:
             else:
                 self._log(f"HTTP Error {code}: {exc}")
                 self.root.after(0, lambda e=exc: messagebox.showerror("API Error", str(e)))
-        except Exception as exc:
+        else:
             self._log(f"Error: {exc}")
             self.root.after(0, lambda e=exc: messagebox.showerror("Error", str(e)))
-        finally:
-            self.root.after(0, lambda: self.fetch_btn.config(state=tk.NORMAL, text="🔍  Fetch Videos"))
 
     # ------------------------------------------------------------------
     # Populate the video list treeview
@@ -817,6 +859,23 @@ class VimeoDownloaderApp:
             return dt.astimezone().strftime("%Y-%m-%d %H:%M")
         except Exception:
             return raw[:16]
+
+    @staticmethod
+    def _build_filename(raw_created: str, title: str) -> str:
+        """Build a sanitized filename: YYYYMMDD_HHMMSS_<sanitized_title>.mp4"""
+        if raw_created:
+            try:
+                dt = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+                prefix = dt.astimezone().strftime("%Y%m%d_%H%M%S_")
+            except Exception:
+                prefix = ""
+        else:
+            prefix = ""
+        # Replace characters not allowed in Windows filenames, plus spaces and periods, with _
+        sanitized = re.sub(r'[\\/:*?"<>|. ]', "_", title)
+        # Capitalize the first letter immediately following each _
+        sanitized = re.sub(r'_(\w)', lambda m: "_" + m.group(1).upper(), sanitized)
+        return f"{prefix}{sanitized}.mp4"
 
     @staticmethod
     def _best_display_quality(video: dict) -> tuple:
@@ -840,14 +899,16 @@ class VimeoDownloaderApp:
         for i, v in enumerate(videos):
             name     = v.get("name") or f"Video {i + 1}"
             duration = format_duration(v.get("duration") or 0)
-            created  = self._format_created(v.get("created_time", ""))
+            raw_created = v.get("created_time", "")
+            created  = self._format_created(raw_created)
+            filename = self._build_filename(raw_created, name)
             quality, size = self._best_display_quality(v)
 
             var = tk.BooleanVar(value=True)
             self.video_check_vars.append(var)
             self.tree.insert(
                 "", tk.END, iid=str(i),
-                values=("☑", name, created, duration, quality, size, "Pending"),
+                values=("☑", name, filename, created, duration, quality, size, "Pending"),
             )
 
         self._update_sel_label()
@@ -873,6 +934,30 @@ class VimeoDownloaderApp:
     # ------------------------------------------------------------------
     # Filter incomplete videos
     # ------------------------------------------------------------------
+    @staticmethod
+    def _row_is_incomplete(vals) -> bool:
+        """Return True if the treeview row is missing duration, quality, or size data."""
+        # cols: check(0) title(1) filename(2) created(3) duration(4) quality(5) size(6) status(7)
+        duration = vals[4] if len(vals) > 4 else ""
+        quality  = vals[5] if len(vals) > 5 else ""
+        size     = vals[6] if len(vals) > 6 else ""
+        return (
+            duration in ("", "--:--", "—")
+            or quality in ("", "—", "yt-dlp")
+            or size in ("", "—", "Unknown")
+        )
+
+    def _reattach_row(self, iid: str, i: int):
+        """Re-insert a detached treeview row at its natural position."""
+        children = list(self.tree.get_children())
+        insert_after = ""
+        for j in range(i - 1, -1, -1):
+            if str(j) in children:
+                insert_after = str(j)
+                break
+        pos = self.tree.index(insert_after) + 1 if insert_after else 0
+        self.tree.reattach(iid, "", pos)
+
     def _apply_filter(self):
         hide = self.hide_incomplete_var.get()
         for i in range(len(self.video_check_vars)):
@@ -880,28 +965,10 @@ class VimeoDownloaderApp:
             if not self.tree.exists(iid):
                 continue
             vals = self.tree.item(iid, "values")
-            # cols: check(0) name(1) created(2) duration(3) quality(4) size(5) status(6)
-            duration = vals[3] if len(vals) > 3 else ""
-            quality  = vals[4] if len(vals) > 4 else ""
-            size     = vals[5] if len(vals) > 5 else ""
-            incomplete = (
-                duration in ("", "--:--", "—")
-                or quality in ("", "—", "yt-dlp")
-                or size in ("", "—", "Unknown")
-            )
-            if hide and incomplete:
+            if hide and self._row_is_incomplete(vals):
                 self.tree.detach(iid)
-            else:
-                # Re-attach in original order if not already present
-                if iid not in self.tree.get_children():
-                    # Find the right position (first visible sibling after i)
-                    children = list(self.tree.get_children())
-                    insert_after = ""
-                    for j in range(i - 1, -1, -1):
-                        if str(j) in children:
-                            insert_after = str(j)
-                            break
-                    self.tree.reattach(iid, "", self.tree.index(insert_after) + 1 if insert_after else 0)
+            elif iid not in self.tree.get_children():
+                self._reattach_row(iid, i)
         self._update_sel_label()
 
     def _refresh_check(self, iid, idx):
@@ -965,7 +1032,7 @@ class VimeoDownloaderApp:
         """Reset row statuses and update button states before starting a download."""
         for i in selected_idx:
             vals = list(self.tree.item(str(i), "values"))
-            vals[6] = "Queued"
+            vals[7] = "Queued"
             self.tree.item(str(i), values=vals, tags=())
 
         self.is_downloading = True
@@ -981,9 +1048,13 @@ class VimeoDownloaderApp:
 
     def _launch_download_worker(self, selected_idx: list, selected_videos: list, out_dir: str):
         """Create and start the DownloadWorker thread."""
+        selected_filenames = [
+            self.tree.item(str(i), "values")[2] for i in selected_idx
+        ]
         self.worker = DownloadWorker(
             api=self.api,
             videos=selected_videos,
+            filenames=selected_filenames,
             output_dir=out_dir,
             quality=self.quality_var.get(),
             add_number_prefix=self.num_prefix_var.get(),
@@ -999,33 +1070,39 @@ class VimeoDownloaderApp:
     # ------------------------------------------------------------------
     def _update_progress(self, selected_idx, v_idx, v_total, done, total, name):
         def _do():
-            if total > 0:
-                pct = (done / total) * 100
-                self.vid_bar["value"] = pct
-                self.vid_pct_lbl.config(
-                    text=f"{format_size(done)} / {format_size(total)}  ({pct:.1f}%)"
-                )
-            else:
-                self.vid_bar["value"] = 0
-                self.vid_pct_lbl.config(text="Downloading…")
-
-            self.cur_lbl.config(text=f"[{v_idx + 1}/{v_total}]  {name}")
-
-            progress_fraction = (done / total) if total > 0 else 0
-            overall_pct = ((v_idx + progress_fraction) / v_total) * 100 if v_total else 0
-            self.overall_bar["value"] = overall_pct
-            self.overall_lbl.config(
-                text=f"Overall: {v_idx + 1} / {v_total}  ({overall_pct:.1f}%)"
-            )
-
-            # Highlight current row
-            iid = str(selected_idx[v_idx])
-            vals = list(self.tree.item(iid, "values"))
-            if vals[6] not in ("Done ✓", "Skipped", "Failed ✗"):
-                vals[6] = "Downloading…"
-                self.tree.item(iid, values=vals, tags=("downloading",))
-
+            self._update_video_bar(done, total, name, v_idx, v_total)
+            self._update_overall_bar(v_idx, v_total, done, total)
+            self._mark_row_downloading(str(selected_idx[v_idx]))
         self.root.after(0, _do)
+
+    def _update_video_bar(self, done: int, total: int, name: str, v_idx: int, v_total: int):
+        """Refresh the per-video progress bar, byte label, and current-video label."""
+        if total > 0:
+            pct = (done / total) * 100
+            self.vid_bar["value"] = pct
+            self.vid_pct_lbl.config(
+                text=f"{format_size(done)} / {format_size(total)}  ({pct:.1f}%)"
+            )
+        else:
+            self.vid_bar["value"] = 0
+            self.vid_pct_lbl.config(text="Downloading…")
+        self.cur_lbl.config(text=f"[{v_idx + 1}/{v_total}]  {name}")
+
+    def _update_overall_bar(self, v_idx: int, v_total: int, done: int, total: int):
+        """Refresh the overall progress bar and label."""
+        progress_fraction = (done / total) if total > 0 else 0
+        overall_pct = ((v_idx + progress_fraction) / v_total) * 100 if v_total else 0
+        self.overall_bar["value"] = overall_pct
+        self.overall_lbl.config(
+            text=f"Overall: {v_idx + 1} / {v_total}  ({overall_pct:.1f}%)"
+        )
+
+    def _mark_row_downloading(self, iid: str):
+        """Update the treeview status cell to 'Downloading…' if not already finished."""
+        vals = list(self.tree.item(iid, "values"))
+        if vals[7] not in ("Done ✓", "Skipped", "Failed ✗"):
+            vals[7] = "Downloading…"
+            self.tree.item(iid, values=vals, tags=("downloading",))
 
     def _on_video_done(self, tree_row_idx, status):
         label_map = {"done": "Done ✓", "failed": "Failed ✗", "skipped": "Skipped"}
@@ -1033,7 +1110,7 @@ class VimeoDownloaderApp:
         def _do():
             iid = str(tree_row_idx)
             vals = list(self.tree.item(iid, "values"))
-            vals[6] = label_map.get(status, status)
+            vals[7] = label_map.get(status, status)
             self.tree.item(iid, values=vals, tags=(status,))
 
         self.root.after(0, _do)
