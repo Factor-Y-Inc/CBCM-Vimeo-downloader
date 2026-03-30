@@ -2,14 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 Vimeo Account Video Downloader
+
 Downloads all videos from a Vimeo user account using an API access token.
 
-Strategy:
-  1. Fetch the full video list via the Vimeo API (/me/videos with pagination).
-  2. For each video, attempt a direct download using the signed URL returned
-     by the API (fastest, no extra dependency).
-  3. Fall back to yt-dlp (with Bearer-token header) for videos that have no
-     API download link (e.g. privacy-restricted or externally hosted).
+Download Strategy:
+  1. Fetch the full video list via Vimeo API (/me/videos with automatic pagination)
+  2. For each video, attempt direct download using the signed URL from API (fastest, no dependencies)
+  3. Fall back to yt-dlp for videos without API download link (privacy-restricted or externally hosted)
+
+Features:
+  - Accurate stream date extracted from video file metadata (not upload date)
+  - Display video ID for easy reference and browser access (double-click to open)
+  - Two-stage download with seamless fallback
+  - Real-time progress tracking per-video and overall
+  - Automatic skip of already-downloaded files
 """
 
 import json
@@ -18,9 +24,10 @@ import re
 import subprocess
 import sys
 import threading
-import tkinter as tk
+import webbrowser
 from datetime import datetime
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+import tkinter as tk
 
 import requests
 import vimeo
@@ -70,7 +77,25 @@ def format_size(num_bytes) -> str:
 # ---------------------------------------------------------------------------
 
 class VimeoAPI:
+    """
+    Wrapper around PyVimeo client for video download operations.
+    
+    Handles:
+    - OAuth client credentials flow (exchange client ID + secret for access token)
+    - Video list fetching with automatic pagination
+    - Best download link selection based on quality preference
+    - Direct file streaming with Bearer token authentication
+    
+    Attributes:
+        token: Vimeo API access token
+        client_id: Vimeo OAuth client ID
+        client_secret: Vimeo OAuth client secret
+        client: PyVimeo VimeoClient instance
+        session: Requests session with Bearer token for direct downloads
+    """
+    
     def __init__(self, token: str, client_id: str = "", client_secret: str = ""):
+        """Initialize with credentials for API access and file downloads."""
         self.token = token
         self.client_id = client_id
         self.client_secret = client_secret
@@ -105,7 +130,7 @@ class VimeoAPI:
         path = base_path
         params = {
             "fields": (
-                "uri,name,duration,link,download,pictures,status,privacy,created_time"
+                "uri,name,duration,link,download,pictures,status,privacy,created_time,modified_time"
             ),
             "per_page": 100,
             "page": 1,
@@ -175,6 +200,25 @@ class VimeoAPI:
 # ---------------------------------------------------------------------------
 
 class DownloadWorker(threading.Thread):
+    """
+    Background thread for parallel video downloading.
+    
+    Manages the complete download lifecycle for a batch of selected videos:
+    1. Direct download via Vimeo API signed URL (if available)
+    2. Fallback to yt-dlp for videos without direct download links
+    3. Real-time progress reporting and logging
+    4. Automatic cleanup of temporary files on failure
+    
+    Attributes:
+        api: VimeoAPI instance for API calls and direct downloads
+        videos: List of video dictionaries to download
+        filenames: Corresponding list of destination filenames
+        output_dir: Output directory for downloaded files
+        quality: Quality preference (best/hd/sd/mobile)
+        add_number_prefix: Whether to prepend sequential numbers to filenames
+        _stop: Threading event for clean shutdown
+    """
+    
     def __init__(
         self,
         api: VimeoAPI,
@@ -188,6 +232,7 @@ class DownloadWorker(threading.Thread):
         video_done_cb,
         all_done_cb,
     ):
+        """Initialize worker with video list and callback handlers."""
         super().__init__(daemon=True)
         self.api = api
         self.videos = videos
@@ -202,6 +247,7 @@ class DownloadWorker(threading.Thread):
         self._stop = threading.Event()
 
     def stop(self):
+        """Signal the worker to stop gracefully."""
         self._stop.set()
 
     # ------------------------------------------------------------------
@@ -357,7 +403,25 @@ class DownloadWorker(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class VimeoDownloaderApp:
+    """
+    Main Tkinter GUI application for downloading videos from Vimeo.
+    
+    Manages the complete workflow:
+    - Configuration (credentials, output path, quality settings)
+    - Video fetching and listing with metadata display
+    - Download queue management with real-time progress
+    - Automatic detection of already-downloaded files
+    
+    Attributes:
+        root: The root Tkinter window
+        api: VimeoAPI instance (set after authentication)
+        videos: List of video dictionaries fetched from Vimeo
+        worker: Active DownloadWorker thread (if downloading)
+        is_downloading: Flag indicating if a download is in progress
+    """
+    
     def __init__(self, root: tk.Tk):
+        """Initialize the application with a Tkinter root window."""
         self.root = root
         self._setup_window()
         self._initialize_state()
@@ -365,7 +429,7 @@ class VimeoDownloaderApp:
         self._build_ui()
     
     def _setup_window(self):
-        """Configure the root window properties."""
+        """Configure the root window properties and icon."""
         self.root.title("Vimeo Account Video Downloader")
         self.root.geometry("980x780")
         self.root.minsize(820, 640)
@@ -581,7 +645,7 @@ class VimeoDownloaderApp:
     # ------------------------------------------------------------------
 
     def _build_video_toolbar(self, list_frame: ttk.Frame):
-        """Select/deselect buttons, selection count label, and filter toggle."""
+        """Select/deselect buttons, selection count label, and filter toggles."""
         toolbar = ttk.Frame(list_frame)
         toolbar.pack(fill=tk.X, pady=(0, 4))
 
@@ -591,43 +655,93 @@ class VimeoDownloaderApp:
         self.sel_lbl.pack(side=tk.LEFT, padx=(8, 0))
         self.downloaded_lbl = ttk.Label(toolbar, text="", foreground="gray")
         self.downloaded_lbl.pack(side=tk.LEFT, padx=(16, 0))
-
+        
+        # Filters row for all filter options
+        filter_frame = ttk.Frame(list_frame)
+        filter_frame.pack(fill=tk.X, pady=(0, 4))
+        
+        ttk.Label(filter_frame, text="Filters:").pack(side=tk.LEFT, padx=(0, 8))
+        
         self.hide_incomplete_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            toolbar, text="Hide videos without duration / quality / size",
+            filter_frame, text="Hide videos without duration / quality / size",
             variable=self.hide_incomplete_var, command=self._apply_filter,
-        ).pack(side=tk.RIGHT, padx=(8, 0))
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        
+        self.hide_rc_service_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_frame, text="Hide R.C. Service",
+            variable=self.hide_rc_service_var, command=self._apply_filter
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        
+        self.hide_re_service_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_frame, text="Hide R.E. Service",
+            variable=self.hide_re_service_var, command=self._apply_filter
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        
+        self.hide_rm_service_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_frame, text="Hide R.M. Service",
+            variable=self.hide_rm_service_var, command=self._apply_filter
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        
+        self.hide_large_video_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_frame, text="Hide large videos (>10GB)",
+            variable=self.hide_large_video_var, command=self._apply_filter
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        
+        self.hide_downloaded_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_frame, text="Hide downloaded videos",
+            variable=self.hide_downloaded_var, command=self._apply_filter
+        ).pack(side=tk.LEFT, padx=(0, 0))
 
     def _build_video_tree(self, list_frame: ttk.Frame):
         """Treeview with columns and row-status colour tags."""
         tree_frame = ttk.Frame(list_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        cols = ("check", "title", "filename", "created", "duration", "quality", "size", "status")
+        cols = ("check", "title", "filename", "stream_date", "video_id", "duration", "quality", "size", "status")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
 
+        # headings = {
+        #     "check":       "✓",
+        #     "title":       "Video Title",
+        #     "filename":    "Video File Name",
+        #     "created":     "Stream Date",
+        #     "stream_date": "Video ID",
+        #     "duration":    "Duration",
+        #     "quality":     "Quality",
+        #     "size":        "Size",
+        #     "status":      "Status",
+        # }
+
         headings = {
-            "check":    "✓",
-            "title":    "Video Title",
-            "filename": "Video File Name",
-            "created":  "Created",
-            "duration": "Duration",
-            "quality":  "Quality",
-            "size":     "Size",
-            "status":   "Status",
+            "check":       "✓",
+            "title":       "Video Title",
+            "filename":    "Video File Name",
+            "stream_date": "Stream Date",
+            "video_id":    "Video ID",
+            "duration":    "Duration",
+            "quality":     "Quality",
+            "size":        "Size",
+            "status":      "Status",
         }
         for col, text in headings.items():
             self.tree.heading(col, text=text)
 
         col_cfg = {
-            "check":    dict(width=32,  minwidth=32,  stretch=False, anchor=tk.CENTER),
-            "title":    dict(width=220, minwidth=140),
-            "filename": dict(width=220, minwidth=140),
-            "created":  dict(width=130, minwidth=110, anchor=tk.CENTER),
-            "duration": dict(width=80,  minwidth=60,  anchor=tk.CENTER),
-            "quality":  dict(width=80,  minwidth=60,  anchor=tk.CENTER),
-            "size":     dict(width=100, minwidth=80,  anchor=tk.E),
-            "status":   dict(width=110, minwidth=80,  anchor=tk.CENTER),
+            "check":       dict(width=32,  minwidth=32,  stretch=False, anchor=tk.CENTER),
+            "title":       dict(width=220, minwidth=140),
+            "filename":    dict(width=220, minwidth=140),
+            "stream_date":     dict(width=130, minwidth=110, anchor=tk.CENTER),
+            "video_id": dict(width=100, minwidth=80,  anchor=tk.CENTER),
+            "duration":    dict(width=80,  minwidth=60,  anchor=tk.CENTER),
+            "quality":     dict(width=80,  minwidth=60,  anchor=tk.CENTER),
+            "size":        dict(width=100, minwidth=80,  anchor=tk.E),
+            "status":      dict(width=110, minwidth=80,  anchor=tk.CENTER),
         }
         for col, kwargs in col_cfg.items():
             self.tree.column(col, **kwargs)
@@ -638,6 +752,7 @@ class VimeoDownloaderApp:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
+        self.tree.bind("<Double-Button-1>", self._on_tree_double_click)
         self.tree.tag_configure("done",        background="#d4edda", foreground="#155724")
         self.tree.tag_configure("failed",      background="#f8d7da", foreground="#721c24")
         self.tree.tag_configure("skipped",     background="#fff3cd", foreground="#856404")
@@ -958,12 +1073,14 @@ class VimeoDownloaderApp:
     # ------------------------------------------------------------------
     @staticmethod
     def _format_created(raw: str) -> str:
-        """Convert an ISO 8601 timestamp to a local-timezone display string."""
+        """Convert an ISO 8601 timestamp to local-timezone display string with timezone label."""
         if not raw:
             return "—"
         try:
             dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+            local_dt = dt.astimezone()
+            tz_label = local_dt.strftime("%Z")
+            return local_dt.strftime(f"%Y-%m-%d %H:%M ({tz_label})")
         except Exception:
             return raw[:16]
 
@@ -1010,8 +1127,19 @@ class VimeoDownloaderApp:
         for i, v in enumerate(videos):
             name     = v.get("name") or f"Video {i + 1}"
             duration = format_duration(v.get("duration") or 0)
-            raw_created = v.get("created_time", "")
+            
+            # Extract livestream date from download object (more accurate than parent created_time)
+            raw_created = ""
+            downloads = v.get("download") or []
+            if downloads and isinstance(downloads, list) and len(downloads) > 0:
+                raw_created = downloads[0].get("created_time", "")
+            if not raw_created:
+                raw_created = v.get("created_time", "")
+            
             created  = self._format_created(raw_created)
+            # Extract video ID from URI
+            uri = v.get("uri", "")
+            video_id = uri.rsplit("/", 1)[-1] if uri else ""
             filename = self._build_filename(raw_created, name)
             quality, size = self._best_display_quality(v)
 
@@ -1031,7 +1159,7 @@ class VimeoDownloaderApp:
                 "", tk.END, iid=iid,
                 values=(
                     "☐",
-                    name, filename, created, duration, quality, size,
+                    name, filename, created, video_id, duration, quality, size,
                     "Done ✓" if already_done else "Pending",
                 ),
                 tags=("done",) if already_done else (),
@@ -1084,21 +1212,89 @@ class VimeoDownloaderApp:
             self._refresh_check(iid, idx)
             self._update_sel_label()
 
+    def _on_tree_double_click(self, event):
+        """Handle double-click to open video in browser."""
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        idx = int(iid)
+        if idx < len(self.videos):
+            video = self.videos[idx]
+            # Try to get URI from video object, or construct from video_id
+            uri = video.get("uri", "")
+            if uri:
+                # URI is like "/videos/12345"
+                video_id = uri.rsplit("/", 1)[-1]
+            else:
+                # Get video_id from tree values
+                vals = self.tree.item(iid, "values")
+                video_id = vals[4] if len(vals) > 4 else ""
+            
+            if video_id:
+                url = f"https://vimeo.com/{video_id}"
+                webbrowser.open_new(url)
+                self._log(f"Opened in browser: {url}")
+
     # ------------------------------------------------------------------
-    # Filter incomplete videos
+    # Filter incomplete videos and services
     # ------------------------------------------------------------------
     @staticmethod
     def _row_is_incomplete(vals) -> bool:
         """Return True if the treeview row is missing duration, quality, or size data."""
-        # cols: check(0) title(1) filename(2) created(3) duration(4) quality(5) size(6) status(7)
-        duration = vals[4] if len(vals) > 4 else ""
-        quality  = vals[5] if len(vals) > 5 else ""
-        size     = vals[6] if len(vals) > 6 else ""
+        # cols: check(0) title(1) filename(2) stream_date(3) video_id(4) duration(5) quality(6) size(7) status(8)
+        duration = vals[5] if len(vals) > 5 else ""
+        quality  = vals[6] if len(vals) > 6 else ""
+        size     = vals[7] if len(vals) > 7 else ""
         return (
             duration in ("", "--:--", "—")
             or quality in ("", "—", "yt-dlp")
             or size in ("", "—", "Unknown")
         )
+    
+    @staticmethod
+    def _row_matches_service(vals, service_name: str) -> bool:
+        """Return True if the treeview row title contains the specified service name."""
+        # cols: check(0) title(1) filename(2) stream_date(3) video_id(4) duration(5) quality(6) size(7) status(8)
+        title = vals[1] if len(vals) > 1 else ""
+        return service_name.lower() in title.lower()
+    
+    @staticmethod
+    def _row_is_large_video(vals) -> bool:
+        """Return True if the treeview row size is greater than 10GB."""
+        # cols: check(0) title(1) filename(2) stream_date(3) video_id(4) duration(5) quality(6) size(7) status(8)
+        size_str = vals[7] if len(vals) > 7 else ""
+        if not size_str or size_str in ("", "—", "Unknown"):
+            return False
+        
+        # Parse size string (e.g., "5.2 GB", "1500 MB", "2.1 TB")
+        try:
+            parts = size_str.split()
+            if len(parts) < 2:
+                return False
+            
+            value = float(parts[0])
+            unit = parts[1].upper()
+            
+            # Convert to bytes
+            unit_map = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4, "PB": 1024**5}
+            if unit not in unit_map:
+                return False
+            
+            size_bytes = value * unit_map[unit]
+            # 10GB in bytes
+            return size_bytes > (10 * 1024**3)
+        except (ValueError, IndexError):
+            return False
+    
+    @staticmethod
+    def _row_is_downloaded(vals) -> bool:
+        """Return True if the treeview row is marked as downloaded."""
+        # cols: check(0) title(1) filename(2) stream_date(3) video_id(4) duration(5) quality(6) size(7) status(8)
+        status = vals[8] if len(vals) > 8 else ""
+        return status == "Done \u2713"
 
     def _reattach_row(self, iid: str, i: int):
         """Re-insert a detached treeview row at its natural position."""
@@ -1112,13 +1308,29 @@ class VimeoDownloaderApp:
         self.tree.reattach(iid, "", pos)
 
     def _apply_filter(self):
-        hide = self.hide_incomplete_var.get()
+        hide_incomplete = self.hide_incomplete_var.get()
+        hide_rc = self.hide_rc_service_var.get()
+        hide_re = self.hide_re_service_var.get()
+        hide_rm = self.hide_rm_service_var.get()
+        hide_large = self.hide_large_video_var.get()
+        hide_downloaded = self.hide_downloaded_var.get()
+        
         for i in range(len(self.video_check_vars)):
             iid = str(i)
             if not self.tree.exists(iid):
                 continue
             vals = self.tree.item(iid, "values")
-            if hide and self._row_is_incomplete(vals):
+            
+            should_hide = (
+                (hide_incomplete and self._row_is_incomplete(vals))
+                or (hide_rc and self._row_matches_service(vals, "Rockville Cantonese Service"))
+                or (hide_re and self._row_matches_service(vals, "Rockville English Service"))
+                or (hide_rm and self._row_matches_service(vals, "Rockville Mandarin Service"))
+                or (hide_large and self._row_is_large_video(vals))
+                or (hide_downloaded and self._row_is_downloaded(vals))
+            )
+            
+            if should_hide:
                 self.tree.detach(iid)
             elif iid not in self.tree.get_children():
                 self._reattach_row(iid, i)
@@ -1130,17 +1342,23 @@ class VimeoDownloaderApp:
         self.tree.item(iid, values=vals)
 
     def _select_all(self):
-        for i, var in enumerate(self.video_check_vars):
+        """Select all visible videos (respects current filter)."""
+        visible_iids = self.tree.get_children()
+        for iid in visible_iids:
+            i = int(iid)
             if i not in self.locked_indices:
-                var.set(True)
-                self._refresh_check(str(i), i)
+                self.video_check_vars[i].set(True)
+                self._refresh_check(iid, i)
         self._update_sel_label()
 
     def _deselect_all(self):
-        for i, var in enumerate(self.video_check_vars):
+        """Deselect all visible videos (respects current filter)."""
+        visible_iids = self.tree.get_children()
+        for iid in visible_iids:
+            i = int(iid)
             if i not in self.locked_indices:
-                var.set(False)
-                self._refresh_check(str(i), i)
+                self.video_check_vars[i].set(False)
+                self._refresh_check(iid, i)
         self._update_sel_label()
 
     def _update_sel_label(self):
@@ -1187,7 +1405,7 @@ class VimeoDownloaderApp:
         """Reset row statuses and update button states before starting a download."""
         for i in selected_idx:
             vals = list(self.tree.item(str(i), "values"))
-            vals[7] = "Queued"
+            vals[8] = "Queued"
             self.tree.item(str(i), values=vals, tags=())
 
         self.is_downloading = True
@@ -1255,11 +1473,11 @@ class VimeoDownloaderApp:
     def _mark_row_downloading(self, iid: str, done: int = 0, total: int = 0):
         """Update the treeview status cell to show downloaded/total size if not already finished."""
         vals = list(self.tree.item(iid, "values"))
-        if vals[7] not in ("Done ✓", "Skipped", "Failed ✗"):
+        if vals[8] not in ("Done ✓", "Skipped", "Failed ✗"):
             if total > 0:
-                vals[7] = f"{format_size(done)} / {format_size(total)}"
+                vals[8] = f"{format_size(done)} / {format_size(total)}"
             else:
-                vals[7] = "Downloading…"
+                vals[8] = "Downloading…"
             self.tree.item(iid, values=vals, tags=("downloading",))
 
     def _update_downloaded_label(self):
@@ -1282,7 +1500,7 @@ class VimeoDownloaderApp:
         def _do():
             iid = str(tree_row_idx)
             vals = list(self.tree.item(iid, "values"))
-            vals[7] = label_map.get(status, status)
+            vals[8] = label_map.get(status, status)
             self.tree.item(iid, values=vals, tags=(status,))
             
             # Update progress label if download completed or skipped
